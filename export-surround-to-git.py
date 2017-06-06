@@ -51,6 +51,8 @@ import datetime
 import sqlite3
 import os
 import shutil
+import shelve
+import string
 
 
 #
@@ -59,6 +61,7 @@ import shutil
 
 # temp directory in cwd, holds files fetched from Surround
 scratchDir = "scratch"
+path_cache = shelve.open("pathcache")
 
 # for efficiency, compile the history regex once beforehand
 histRegex = re.compile(r"^(?P<action>[\w]+([^\[\]\r\n]*[\w]+)?)(\[(?P<data>[^\[\]\r\n]*?)( v\. [\d]+)?\]| from \[(?P<from>[^\[\]\r\n]*)\] to \[(?P<to>[^\[\]\r\n]*)\])?([\s]+)(?P<author>[\w]+([^\[\]\r\n]*[\w]+)?)([\s]+)(?P<version>[\d]+)([\s]+)(?P<timestamp>[\w]+[^\[\]\r\n]*)$", re.MULTILINE | re.DOTALL)
@@ -95,6 +98,7 @@ actionMap = {"add"                   : Actions.FILE_MODIFY,
              "checkin"               : Actions.FILE_MODIFY,
              "delete"                : Actions.FILE_DELETE,
              "duplicate"             : Actions.FILE_MODIFY,
+             "duplicate from"        : Actions.FILE_MODIFY,
              "file destroyed"        : Actions.FILE_DELETE,
              "file moved"            : Actions.FILE_RENAME,
              "file renamed"          : Actions.FILE_RENAME,
@@ -122,7 +126,14 @@ actionMap = {"add"                   : Actions.FILE_MODIFY,
 # classes
 #
 
+printable = set(string.printable)
+
+def filter_non_ascii(s):
+    return filter(lambda x: x in printable, s)
+
 class DatabaseRecord:
+
+
     def __init__(self, tuple):
         self.init(tuple[0], tuple[1], tuple[2], tuple[3], tuple[4], tuple[5], tuple[6], tuple[7], tuple[8], tuple[9])
 
@@ -135,7 +146,7 @@ class DatabaseRecord:
         self.origPath = origPath
         self.version = version
         self.author = author
-        self.comment = comment
+        self.comment = comment if not isinstance(comment, basestring) else filter_non_ascii(comment)
         self.data = data
 
     def get_tuple(self):
@@ -148,24 +159,28 @@ def verify_surround_environment():
     with open(os.devnull, 'w') as fnull:
         p = subprocess.Popen(cmd, shell=True, stdout=fnull, stderr=fnull)
         p.communicate()
-        return (p.returncode == 0)
+        result = (p.returncode == 0)
+        print("verify_surround_environment", result)
+        return result
 
 
 def get_lines_from_sscm_cmd(sscm_cmd):
     # helper function to clean each item on a line since sscm has lots of newlines
-    p = subprocess.Popen(sscm_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(sscm_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
     stdoutdata, stderrdata = p.communicate()
     stderrdata = stderrdata.strip()
     if stderrdata:
-        sys.stderr.write('\n')
-        sys.stderr.write(stderrdata)
-    return [real_line for real_line in stdoutdata.split('\n') if real_line]
+        sys.stdout.write('\nTHAT\n')
+        sys.stdout.write(stderrdata)
+
+    print("get_lines_from_sscm_cmd", sscm_cmd)
+    return [real_line.strip("\r") for real_line in stdoutdata.split('\n') if real_line]
 
 
 def find_all_branches_in_mainline_containing_path(mainline, path):
     # pull out lines from `lsbranch` that are of type baseline, mainline, or snapshot.
     # no sense in adding the `-d` switch, as `sscm ls` won't list anything for deleted branches.
-    cmd = 'sscm lsbranch -b"%s" -p"%s" | sed -r \'s/ \((baseline|mainline|snapshot)\)$//g\'' % (mainline, path)
+    cmd = '''sscm lsbranch -b"%s" -p"%s" | sed -r "s/ \((baseline|mainline|snapshot)\)//g"''' % (mainline, path)
     # FTODO this command yields branches that don't include the path specified.
     # should we filter them out here?  may increase efficiency to not deal with them later.
     # NOTE: don't use '-f' with this command, as it really restricts overall usage.
@@ -175,47 +190,71 @@ def find_all_branches_in_mainline_containing_path(mainline, path):
 def find_all_files_in_branches_under_path(mainline, branches, path):
     fileSet = set()
     for branch in branches:
-        sys.stderr.write("\n[*] Looking for files in branch '%s' ..." % branch)
+        branchSet = set()
+        sys.stdout.write("\n[*] Looking for files in branch '%s' ..." % branch)
+        key = "{}/{}/{}".format(mainline, branch, path)
+        if path_cache.has_key(key):
+            fileSet = fileSet.union(path_cache[key])
+            continue
+
 
         # use all lines from `ls` except for a few
-        cmd = 'sscm ls -b"%s" -p"%s" -r | grep -v \'Total listed files\' | sed -r \'s/unknown status.*$//g\'' % (branch, path)
+        cmd = '''sscm ls -b"%s" -p"%s" -r | grep -v "checked out by" | grep -v "Total listed files" | sed -r "s/(unknown status| current   | missing  ).*$//g"''' % (branch, path)
         lines = get_lines_from_sscm_cmd(cmd)
 
         # directories are listed on their own line, before a section of their files
         for line in lines:
+            if not line:
+                continue
             if line[0] != ' ':
                 lastDirectory = line
             elif line[1] != ' ':
-                fileSet.add("%s/%s" % (lastDirectory, line.strip()))
+                branchSet.add("%s/%s" % (lastDirectory, line.strip()))
+
+
+        path_cache[key] = branchSet
+        path_cache.sync()
+        fileSet = fileSet.union(branchSet)
 
     return fileSet
 
 
 def is_snapshot_branch(branch, repo):
+    key = "is_snapshot_branch:{}/{}".format(branch, repo)
+    if path_cache.has_key(key):
+        return path_cache[key]
     # TODO can we eliminate 'repo' as an argument to this function?
     cmd = 'sscm branchproperty -b"%s" -p"%s"' % (branch, repo)
     with open(os.devnull, 'w') as fnull:
         result = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=fnull).communicate()[0]
-    return result.find("snapshot") != -1
+    is_snapshot = result.find("snapshot") != -1
+    path_cache[key] = is_snapshot
+    path_cache.sync()
+    return is_snapshot
 
 
 def find_all_file_versions(mainline, branch, path):
+    key = "find_all_file_versions:{}/{}/{}".format(mainline, branch, path)
+    if path_cache.has_key(key):
+        return path_cache[key]
+
     repo, file = os.path.split(path)
 
     cmd = 'sscm history "%s" -b"%s" -p"%s" | tail -n +5' % (file, branch, repo)
     lines = get_lines_from_sscm_cmd(cmd)
 
     # this is complicated because the comment for a check-in will be on the line *following* a regex match
+
     versionList = []
     comment = None
     bFoundOne = False
     for line in lines:
-        #sys.stderr.write("\n=== Trying line = " + line)
+        #sys.stdout.write("\n=== Trying line = " + line)
 
         result = histRegex.search(line)
         if result:
             # we have a new match.
-            #sys.stderr.write("\n******* line match!")
+            #sys.stdout.write("\n******* line match!")
 
             if bFoundOne:
                 # before processing this match, we need to commit the previously found version
@@ -238,7 +277,7 @@ def find_all_file_versions(mainline, branch, path):
                 data = result.group("data")
         else:
             # no match.  this must be a comment line (or the start of a new history line, with a line break).
-            #sys.stderr.write("\n------- no line match")
+            #sys.stdout.write("\n------- no line match")
 
             if not comment:
                 # start of comment
@@ -255,7 +294,7 @@ def find_all_file_versions(mainline, branch, path):
                 for i in range(len(commentLines) - 1):
                     substrings.append('\n'.join(commentLines[i:len(commentLines)]))
                 for substring in substrings:
-                    #sys.stderr.write("\n----- Trying substring = " + substring)
+                    #sys.stdout.write("\n----- Trying substring = " + substring)
 
                     result = histRegex.search(substring)
                     if result:
@@ -289,14 +328,16 @@ def find_all_file_versions(mainline, branch, path):
                             # we're (possibly) in a branch scenario
                             data = result.group("data")
 
-                        #sys.stderr.write("\n******* comment match! action = '" + str(action) + "' comment = '" + str(comment) + "'")
+                        #sys.stdout.write("\n******* comment match! action = '" + str(action) + "' comment = '" + str(comment) + "'")
                         break
 
     # before moving on, we need to commit the last found version
     if bFoundOne:
         versionList.append((timestamp, action, origFile, int(version), author, comment, data))
+    path_cache[key] = versionList
+    path_cache.sync()
+    #sys.stdout.write("\nreturning versionList = " + str(versionList))
 
-    #sys.stderr.write("\nreturning versionList = " + str(versionList))
 
     return versionList
 
@@ -312,49 +353,76 @@ def create_database():
     return database
 
 
+def add_many_record_to_database(records, database):
+    if not records:
+        return
+    c = database.cursor()
+    print("insert ", len(records))
+    try:
+        c.executemany('''INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (record.get_tuple() for record in records))
+    except sqlite3.IntegrityError as e:
+        # TODO is there a better way to detect duplicates?  is sqlite3.IntegrityError too wide a net?
+        sys.stdout.write("\nDetected duplicate record %s" % str(record.get_tuple()))
+        print(e)
+        pass
+    database.commit()
+
 def add_record_to_database(record, database):
     c = database.cursor()
     try:
         c.execute('''INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', record.get_tuple())
     except sqlite3.IntegrityError as e:
         # TODO is there a better way to detect duplicates?  is sqlite3.IntegrityError too wide a net?
-        #sys.stderr.write("\nDetected duplicate record %s" % str(record.get_tuple()))
+        sys.stdout.write("\nDetected duplicate record %s" % str(record.get_tuple()))
         pass
+    print(record.get_tuple())
     database.commit()
 
     if record.action == Actions.FILE_RENAME:
         c.execute('''UPDATE operations SET origPath=? WHERE action=? AND mainline=? AND branch=? AND path=? AND (origPath IS NULL OR origPath='') AND version<=?''', (record.origPath, Actions.FILE_MODIFY, record.mainline, record.branch, record.path, record.version))
         database.commit()
 
+def get_epoch(timestamp):
+    usa_format = "%m/%d/%Y %I:%M %p"
+    eu_format = "%d.%m.%Y %H:%M"
+    dt_format = usa_format if "/" in timestamp else eu_format
+    epoch = int(time.mktime(time.strptime(timestamp, dt_format)))
+    return epoch
+
 
 def cmd_parse(mainline, path, database):
-    sys.stderr.write("[+] Beginning parse phase...")
+    sys.stdout.write("[+] Beginning parse phase...")
 
     branches = find_all_branches_in_mainline_containing_path(mainline, path)
+    print(branches, mainline, path)
 
     # NOTE how we're passing branches, not branch.  this is to detect deleted files.
     filesToWalk = find_all_files_in_branches_under_path(mainline, branches, path)
 
     for branch in branches:
-        sys.stderr.write("\n[*] Parsing branch '%s' ..." % branch)
+        print("Branch", branch)
+        sys.stdout.write("\n[*] Parsing branch '%s' ..." % branch)
 
         for fullPathWalk in filesToWalk:
-            #sys.stderr.write("\n[*] \tParsing file '%s' ..." % fullPathWalk)
+            print("Process {}; {}".format(branch, fullPathWalk))
+            #sys.stdout.write("\n[*] \tParsing file '%s' ..." % fullPathWalk)
 
             pathWalk, fileWalk = os.path.split(fullPathWalk)
 
             versions = find_all_file_versions(mainline, branch, fullPathWalk)
-            #sys.stderr.write("\n[*] \t\tversions = %s" % versions)
+            #sys.stdout.write("\n[*] \t\tversions = %s" % versions)
+
+            records = []
 
             for timestamp, action, origPath, version, author, comment, data in versions:
-                epoch = int(time.mktime(time.strptime(timestamp, "%m/%d/%Y %I:%M %p")))
+                epoch = get_epoch(timestamp)
                 # branch operations don't follow the actionMap
                 if action == "add to branch":
                     if is_snapshot_branch(data, pathWalk):
                         branchAction = Actions.BRANCH_SNAPSHOT
                     else:
                         branchAction = Actions.BRANCH_BASELINE
-                    add_record_to_database(DatabaseRecord((epoch, branchAction, mainline, branch, path, None, version, author, comment, data)), database)
+                    records.append(DatabaseRecord((epoch, branchAction, mainline, branch, path, None, version, author, comment, data)))
                 else:
                     if origPath:
                         if action == "renamed":
@@ -365,9 +433,10 @@ def cmd_parse(mainline, path, database):
                             data = os.path.join(data, fileWalk)
                     else:
                         origFullPath = None
-                    add_record_to_database(DatabaseRecord((epoch, actionMap[action], mainline, branch, fullPathWalk, origFullPath, version, author, comment, data)), database)
+                    records.append(DatabaseRecord((epoch, actionMap[action], mainline, branch, fullPathWalk, origFullPath, version, author, comment, data)))
+            add_many_record_to_database(records, database)
 
-    sys.stderr.write("\n[+] Parse phase complete")
+    sys.stdout.write("\n[+] Parse phase complete")
 
 
 # Surround has different naming rules for branches than Git does for branches/tags.
@@ -561,7 +630,7 @@ def get_next_database_record(database, c):
 
 
 def cmd_export(database):
-    sys.stderr.write("\n[+] Beginning export phase...\n")
+    sys.stdout.write("\n[+] Beginning export phase...\n")
 
     count = 0
     c, record = get_next_database_record(database, None)
@@ -585,7 +654,7 @@ def cmd_export(database):
         # TODO why doesn't this work?  is this too early since we're piping our output, and then `git fast-import` just creates it again?
         os.remove("./.git/TAG_FIXUP")
 
-    sys.stderr.write("\n[+] Export complete.  Your new Git repository is ready to use.\nDon't forget to run `git repack` at some future time to improve data locality and access performance.\n\n")
+    sys.stdout.write("\n[+] Export complete.  Your new Git repository is ready to use.\nDon't forget to run `git repack` at some future time to improve data locality and access performance.\n\n")
 
 
 def cmd_verify(mainline, path):
