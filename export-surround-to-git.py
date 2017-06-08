@@ -64,7 +64,7 @@ scratchDir = "scratch"
 path_cache = shelve.open("pathcache")
 
 # for efficiency, compile the history regex once beforehand
-histRegex = re.compile(r"^(?P<action>[\w]+([^\[\]\r\n]*[\w]+)?)(\[(?P<data>[^\[\]\r\n]*?)( v\. [\d]+)?\]| from \[(?P<from>[^\[\]\r\n]*)\] to \[(?P<to>[^\[\]\r\n]*)\])?([\s]+)(?P<author>[\w]+([^\[\]\r\n]*[\w]+)?)([\s]+)(?P<version>[\d]+)([\s]+)(?P<timestamp>[\w]+[^\[\]\r\n]*)$", re.MULTILINE | re.DOTALL)
+histRegex = re.compile(r"^(?P<action>[\w]+([^\(\)\[\]\r\n]*[\w]+)?)(?P<comment>\s+\([\w\W ]+\))?(\[(?P<data>[^\[\]\r\n]*?)( v\. [\d]+)?\]| from \[(?P<from>[^\[\]\r\n]*)\] to \[(?P<to>[^\[\]\r\n]*)\])?([\s]+)(?P<author>[\w]+([^\[\]\r\n]*[\w]+)?)([\s]+)(?P<version>[\d]+)([\s]+)(?P<timestamp>[\w]+[^\[\]\r\n]*)$", re.MULTILINE | re.DOTALL)
 
 # global "mark" number.  incremented before used, as 1 is minimum value allowed.
 mark = 0
@@ -94,10 +94,11 @@ actionMap = {"add"                   : Actions.FILE_MODIFY,
              "attach to requirement" : None,  # TODO maybe use lightweight Git tag to track this
              "attach to observation" : None,  # TODO maybe use lightweight Git tag to track this
              "attach to external"    : None,  # TODO maybe use lightweight Git tag to track this
+             "attach to defect"      : None,
              "break share"           : None,
              "checkin"               : Actions.FILE_MODIFY,
              "delete"                : Actions.FILE_DELETE,
-             "duplicate"             : Actions.FILE_MODIFY,
+             "duplicate"             : None,
              "duplicate from"        : Actions.FILE_MODIFY,
              "file destroyed"        : Actions.FILE_DELETE,
              "file moved"            : Actions.FILE_RENAME,
@@ -155,6 +156,7 @@ class DatabaseRecord:
 
 def verify_surround_environment():
     # verify we have sscm client installed and in PATH
+    print("verify_surround_environment")
     cmd = "sscm version"
     with open(os.devnull, 'w') as fnull:
         p = subprocess.Popen(cmd, shell=True, stdout=fnull, stderr=fnull)
@@ -199,7 +201,7 @@ def find_all_files_in_branches_under_path(mainline, branches, path):
 
 
         # use all lines from `ls` except for a few
-        cmd = '''sscm ls -b"%s" -p"%s" -r | grep -v "checked out by" | grep -v "Total listed files" | sed -r "s/(unknown status| current   | missing  ).*$//g"''' % (branch, path)
+        cmd = '''sscm ls -b"%s" -p"%s" -r | grep -v "checked out by" | grep -v "Total listed files" | sed -r "s/(unknown status| current   | missing  | old  ).*$//g"''' % (branch, path)
         lines = get_lines_from_sscm_cmd(cmd)
 
         # directories are listed on their own line, before a section of their files
@@ -248,8 +250,20 @@ def find_all_file_versions(mainline, branch, path):
     versionList = []
     comment = None
     bFoundOne = False
+    mergeLine = False
+    prev_line = ""
     for line in lines:
         #sys.stdout.write("\n=== Trying line = " + line)
+
+        if line.startswith('checkin') and len(line) > 80:
+            mergeLine = True
+            prev_line = line
+            continue
+
+        if mergeLine:
+            mergeLine = False
+            line = prev_line + line
+            line = line.strip()
 
         result = histRegex.search(line)
         if result:
@@ -268,7 +282,7 @@ def find_all_file_versions(mainline, branch, path):
             version = result.group("version")
             timestamp = result.group("timestamp")
             # reset comment
-            comment = None
+            comment = result.group("comment")
             if origFile and to:
                 # we're in a rename/move scenario
                 data = to
@@ -278,10 +292,11 @@ def find_all_file_versions(mainline, branch, path):
         else:
             # no match.  this must be a comment line (or the start of a new history line, with a line break).
             #sys.stdout.write("\n------- no line match")
+            comment_in_line = re.sub("^ Comments \- ", "", line, count=1)
 
-            if not comment:
+            if comment_in_line or not comment:
                 # start of comment
-                comment = re.sub("^ Comments \- ", "", line, count=1)
+                comment = comment_in_line
             else:
                 # continuation of comment
                 comment += "\n" + line
@@ -319,6 +334,10 @@ def find_all_file_versions(mainline, branch, path):
                         author = result.group("author")
                         version = result.group("version")
                         timestamp = result.group("timestamp")
+                        if "." not in timestamp and "/" not in timestamp:
+                            print("WRONG TIMESTAMP!!!!", line)
+                            print("WRONG TIMESTAMP!!!!", timestamp)
+                            import pdb; pdb.set_trace()
                         # reset comment
                         comment = None
                         if origFile and to:
@@ -336,6 +355,7 @@ def find_all_file_versions(mainline, branch, path):
         versionList.append((timestamp, action, origFile, int(version), author, comment, data))
     path_cache[key] = versionList
     path_cache.sync()
+
     #sys.stdout.write("\nreturning versionList = " + str(versionList))
 
 
@@ -356,15 +376,20 @@ def create_database():
 def add_many_record_to_database(records, database):
     if not records:
         return
+
     c = database.cursor()
+    values = (record.get_tuple() for record in records)
     print("insert ", len(records))
     try:
-        c.executemany('''INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (record.get_tuple() for record in records))
+        c.executemany('''INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', values)
     except sqlite3.IntegrityError as e:
         # TODO is there a better way to detect duplicates?  is sqlite3.IntegrityError too wide a net?
-        sys.stdout.write("\nDetected duplicate record %s" % str(record.get_tuple()))
+        sys.stdout.write("\nDetected duplicate record %s" % str(values))
         print(e)
-        pass
+        database.rollback()
+        for record in records:
+            add_record_to_database(record, database)
+        return
     database.commit()
 
 def add_record_to_database(record, database):
@@ -373,9 +398,8 @@ def add_record_to_database(record, database):
         c.execute('''INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', record.get_tuple())
     except sqlite3.IntegrityError as e:
         # TODO is there a better way to detect duplicates?  is sqlite3.IntegrityError too wide a net?
-        sys.stdout.write("\nDetected duplicate record %s" % str(record.get_tuple()))
+        sys.stdout.write("\nDetected duplicate record %s" % str(record))
         pass
-    print(record.get_tuple())
     database.commit()
 
     if record.action == Actions.FILE_RENAME:
@@ -389,6 +413,21 @@ def get_epoch(timestamp):
     epoch = int(time.mktime(time.strptime(timestamp, dt_format)))
     return epoch
 
+def is_sscm_empty_dir(branch, path):
+    cmd = '''sscm history "/" -b"{}" -p"{}"'''.format(branch, path)
+    result = get_lines_from_sscm_cmd(cmd)
+    if not result:
+        return True
+
+def get_first_empty_dir(path, branch, path_set):
+    dirs = path.split('/')
+    for i, key in enumerate(dirs, 1):
+        path = "/".join(dirs[:i])
+        if path not in path_set and is_sscm_empty_dir(branch, path):
+            return path + "/"
+        else:
+            path_set.add(path)
+
 
 def cmd_parse(mainline, path, database):
     sys.stdout.write("[+] Beginning parse phase...")
@@ -398,21 +437,33 @@ def cmd_parse(mainline, path, database):
 
     # NOTE how we're passing branches, not branch.  this is to detect deleted files.
     filesToWalk = find_all_files_in_branches_under_path(mainline, branches, path)
+    filesToWalk = list(filesToWalk)
+    filesToWalk.sort()
 
     for branch in branches:
         print("Branch", branch)
         sys.stdout.write("\n[*] Parsing branch '%s' ..." % branch)
 
+        records = []
+        existing_paths = set()
+        current_empty_dir = ""
         for fullPathWalk in filesToWalk:
             print("Process {}; {}".format(branch, fullPathWalk))
+            if current_empty_dir and fullPathWalk.startswith(current_empty_dir):
+                print("Skip: {}".format(fullPathWalk))
+                continue
+
             #sys.stdout.write("\n[*] \tParsing file '%s' ..." % fullPathWalk)
 
             pathWalk, fileWalk = os.path.split(fullPathWalk)
 
             versions = find_all_file_versions(mainline, branch, fullPathWalk)
             #sys.stdout.write("\n[*] \t\tversions = %s" % versions)
+            if not versions and pathWalk not in existing_paths:
+                current_empty_dir = get_first_empty_dir(fullPathWalk, branch, existing_paths)
+                print("Empty dir, will skip all below:", current_empty_dir)
+                continue
 
-            records = []
 
             for timestamp, action, origPath, version, author, comment, data in versions:
                 epoch = get_epoch(timestamp)
@@ -434,7 +485,10 @@ def cmd_parse(mainline, path, database):
                     else:
                         origFullPath = None
                     records.append(DatabaseRecord((epoch, actionMap[action], mainline, branch, fullPathWalk, origFullPath, version, author, comment, data)))
-            add_many_record_to_database(records, database)
+            if len(records) > 100:
+                add_many_record_to_database(records, database)
+                records = []
+        add_many_record_to_database(records, database)
 
     sys.stdout.write("\n[+] Parse phase complete")
 
@@ -629,10 +683,11 @@ def get_next_database_record(database, c):
     return c, c.fetchone()
 
 
-def cmd_export(database):
+def cmd_export(database_path):
     sys.stdout.write("\n[+] Beginning export phase...\n")
 
     count = 0
+    database = sqlite3.connect(database_path)
     c, record = get_next_database_record(database, None)
     count = count + 1
     while (record):
@@ -664,9 +719,7 @@ def cmd_verify(mainline, path):
     pass
 
 
-def handle_command(parser):
-    args = parser.parse_args()
-
+def handle_command(args):
     if args.command == "parse" and args.mainline and args.path:
         verify_surround_environment()
         database = create_database()
@@ -698,12 +751,18 @@ def parse_arguments():
     parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
     parser.add_argument('command', nargs='?', default='all')
     parser.epilog = "Example flow:\n\tsscm setclient ...\n\tgit init my-new-repo\n\tcd my-new-repo\n\texport-surround-to-git.py -m Sandbox -p \"Sandbox/Merge Test\" -f blah.txt | git fast-import --stats --export-marks=marks.txt\n\t...\n\tgit repack ..."
-    return parser
+
+    args = parser.parse_args()
+
+    if args.database:
+        args.command = "export"
+
+    return args
 
 
 def main():
-    parser = parse_arguments()
-    handle_command(parser)
+    args = parse_arguments()
+    handle_command(args)
     sys.exit(0)
 
 
