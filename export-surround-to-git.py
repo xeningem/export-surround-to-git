@@ -24,7 +24,6 @@
 # attempt to support both Python2.6+ and Python3
 from __future__ import print_function
 
-
 VERSION = '0.5.0'
 
 
@@ -53,7 +52,7 @@ import os
 import shutil
 import shelve
 import string
-
+import stat
 
 #
 # globals
@@ -61,10 +60,11 @@ import string
 
 # temp directory in cwd, holds files fetched from Surround
 scratchDir = "scratch"
-path_cache = shelve.open("pathcache")
+path_cache = shelve.open("pathcache.cache")
 
 # for efficiency, compile the history regex once beforehand
-histRegex = re.compile(r"^(?P<action>[\w]+([^\(\)\[\]\r\n]*[\w]+)?)(?P<comment>\s+\([\w\W ]+\))?(\[(?P<data>[^\[\]\r\n]*?)( v\. [\d]+)?\]| from \[(?P<from>[^\[\]\r\n]*)\] to \[(?P<to>[^\[\]\r\n]*)\])?([\s]+)(?P<author>[\w]+([^\[\]\r\n]*[\w]+)?)([\s]+)(?P<version>[\d]+)([\s]+)(?P<timestamp>[\w]+[^\[\]\r\n]*)$", re.MULTILINE | re.DOTALL)
+
+histRegex = re.compile(r"^(?P<action>[a-z]+[\w]+([^\(\)\[\]\r\n]*[\w]+)?)(?P<comment>\s+\([\w\W ]+\))?(\[(?P<data>[^\[\]\r\n]*?)( v\. [\d]+)?\]| from \[(?P<from>[^\[\]\r\n]*)\] to \[(?P<to>[^\[\]\r\n]*)\])?([\s]+)(?P<author>[\w]+([^\[\]\r\n]*[\w]+)?)([\s]+)(?P<version>[\d]+)([\s]+)(?P<timestamp>[\w]+[^\[\]\r\n]*)$", re.MULTILINE | re.DOTALL)
 
 # global "mark" number.  incremented before used, as 1 is minimum value allowed.
 mark = 0
@@ -129,6 +129,12 @@ actionMap = {"add"                   : Actions.FILE_MODIFY,
 
 printable = set(string.printable)
 
+def binprint(s=""):
+    with open("fastimport.txt", 'a+b') as fin:
+        fin.write(s)
+        fin.write("\x0A")
+
+
 def filter_non_ascii(s):
     return filter(lambda x: x in printable, s)
 
@@ -156,13 +162,13 @@ class DatabaseRecord:
 
 def verify_surround_environment():
     # verify we have sscm client installed and in PATH
-    print("verify_surround_environment")
+    # print("verify_surround_environment")
     cmd = "sscm version"
     with open(os.devnull, 'w') as fnull:
         p = subprocess.Popen(cmd, shell=True, stdout=fnull, stderr=fnull)
         p.communicate()
         result = (p.returncode == 0)
-        print("verify_surround_environment", result)
+        # print("verify_surround_environment", result)
         return result
 
 
@@ -176,7 +182,7 @@ def get_lines_from_sscm_cmd(sscm_cmd):
         sys.stdout.write(stderrdata)
 
     print("get_lines_from_sscm_cmd", sscm_cmd)
-    return [real_line.strip("\r") for real_line in stdoutdata.split('\n') if real_line]
+    return [real_line.strip("\n") for real_line in stdoutdata.split('\n') if real_line]
 
 
 def find_all_branches_in_mainline_containing_path(mainline, path):
@@ -240,9 +246,11 @@ def find_all_file_versions(mainline, branch, path):
     if path_cache.has_key(key):
         return path_cache[key]
 
+    print("find_all_file_versions: =>{}; =>{}; =>{}".format(mainline,branch, path))
     repo, file = os.path.split(path)
 
     cmd = 'sscm history "%s" -b"%s" -p"%s" | tail -n +5' % (file, branch, repo)
+    print(cmd)
     lines = get_lines_from_sscm_cmd(cmd)
 
     # this is complicated because the comment for a check-in will be on the line *following* a regex match
@@ -255,17 +263,19 @@ def find_all_file_versions(mainline, branch, path):
     for line in lines:
         #sys.stdout.write("\n=== Trying line = " + line)
 
-        if line.startswith('checkin') and len(line) > 80:
-            mergeLine = True
-            prev_line = line
-            continue
+        #if line.startswith('checkin') and len(line) > 80:
+        #    mergeLine = True
+        #    prev_line = line.rstrip()
+        #    continue
 
-        if mergeLine:
-            mergeLine = False
-            line = prev_line + line
-            line = line.strip()
+        #if mergeLine:
+        #    mergeLine = False
+        #    line = prev_line.rstrip() + line
+
+        line = line.rstrip()
 
         result = histRegex.search(line)
+        print(line)
         if result:
             # we have a new match.
             #sys.stdout.write("\n******* line match!")
@@ -281,8 +291,9 @@ def find_all_file_versions(mainline, branch, path):
             author = result.group("author")
             version = result.group("version")
             timestamp = result.group("timestamp")
+            get_epoch(timestamp)
             # reset comment
-            comment = result.group("comment")
+            comment = result.group("comment") or ""
             if origFile and to:
                 # we're in a rename/move scenario
                 data = to
@@ -294,12 +305,12 @@ def find_all_file_versions(mainline, branch, path):
             #sys.stdout.write("\n------- no line match")
             comment_in_line = re.sub("^ Comments \- ", "", line, count=1)
 
-            if comment_in_line or not comment:
+            if comment_in_line:
                 # start of comment
                 comment = comment_in_line
             else:
                 # continuation of comment
-                comment += "\n" + line
+                comment += "\n" + (line or "")
 
                 # check for a multi-line comment that is actually a version match
                 commentLines = [real_line for real_line in comment.split('\n') if real_line]
@@ -325,6 +336,7 @@ def find_all_file_versions(mainline, branch, path):
 
                         if bFoundOne:
                             # before processing this match, we need to commit the previously found version
+                            get_epoch(timestamp)
                             versionList.append((timestamp, action, origFile, int(version), author, comment, data))
                         # set bFoundOne once we've found our first version
                         bFoundOne = True
@@ -334,6 +346,7 @@ def find_all_file_versions(mainline, branch, path):
                         author = result.group("author")
                         version = result.group("version")
                         timestamp = result.group("timestamp")
+                        get_epoch(timestamp)
                         if "." not in timestamp and "/" not in timestamp:
                             print("WRONG TIMESTAMP!!!!", line)
                             print("WRONG TIMESTAMP!!!!", timestamp)
@@ -352,6 +365,7 @@ def find_all_file_versions(mainline, branch, path):
 
     # before moving on, we need to commit the last found version
     if bFoundOne:
+        get_epoch(timestamp)
         versionList.append((timestamp, action, origFile, int(version), author, comment, data))
     path_cache[key] = versionList
     path_cache.sync()
@@ -545,7 +559,8 @@ def print_blob_for_file(branch, fullPath, version=None):
     path, file = os.path.split(fullPath)
     localPath = os.path.join(scratchDir, file)
     if os.path.isfile(localPath):
-        os.remove(localPath)
+        os.chmod(localPath, stat.S_IWRITE)
+        os.unlink(localPath)
     if version:
         # get specified version
         cmd = 'sscm get "%s" -b"%s" -p"%s" -d"%s" -f -i -v%d' % (file, branch, path, scratchDir, version)
@@ -556,11 +571,11 @@ def print_blob_for_file(branch, fullPath, version=None):
         subprocess.Popen(cmd, shell=True, stdout=fnull, stderr=fnull).communicate()
 
     mark = mark + 1
-    print("blob")
-    print("mark :%d" % mark)
-    print("data %d" % os.path.getsize(localPath))
+    binprint("blob")
+    binprint("mark :%d" % mark)
+    binprint("data %d" % os.path.getsize(localPath))
     with open(localPath, "rb") as f:
-        print(f.read())
+        binprint(f.read())
     return mark
 
 
@@ -572,8 +587,8 @@ def process_database_record(record):
         # this is necessary since Surround version-controls individual files, and Git controls the state of the entire branch.
         # the purpose of this commit it to bring the branch state to match the snapshot exactly.
 
-        print("reset TAG_FIXUP")
-        print("from refs/heads/%s" % translate_branch_name(record.branch))
+        binprint("reset TAG_FIXUP")
+        binprint("from refs/heads/%s" % translate_branch_name(record.branch))
 
         # get all files contained within snapshot
         files = find_all_files_in_branches_under_path(record.mainline, [record.data], record.path)
@@ -585,36 +600,36 @@ def process_database_record(record):
                 startMark = blobMark
 
         mark = mark + 1
-        print("commit TAG_FIXUP")
-        print("mark :%d" % mark)
+        binprint("commit TAG_FIXUP")
+        binprint("mark :%d" % mark)
         # we don't have the legit email addresses, so we just use the author as the email address
-        print("author %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
-        print("committer %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
+        binprint("author %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
+        binprint("committer %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
         if record.comment:
-            print("data %d" % len(record.comment))
-            print(record.comment)
+            binprint("data %d" % len(record.comment))
+            binprint(record.comment)
         else:
-            print("data 0")
+            binprint("data 0")
 
         # 'deleteall' tells Git to forget about previous branch state
-        print("deleteall")
+        binprint("deleteall")
         # replay branch state from above-recorded marks
         iterMark = startMark
         for file in files:
-            print("M 100644 :%d %s" % (iterMark, file))
+            binprint("M 100644 :%d %s" % (iterMark, file))
             iterMark = iterMark + 1
         if iterMark != mark:
             raise Exception("Marks fell out of sync while tagging '%s'." % record.data)
 
         # finally, tag our result
-        print("tag %s" % translate_branch_name(record.data))
-        print("from TAG_FIXUP")
-        print("tagger %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
+        binprint("tag %s" % translate_branch_name(record.data))
+        binprint("from TAG_FIXUP")
+        binprint("tagger %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
         if record.comment:
-            print("data %d" % len(record.comment))
-            print(record.comment)
+            binprint("data %d" % len(record.comment))
+            binprint(record.comment)
         else:
-            print("data 0")
+            binprint("data 0")
 
         # save off the mapping between the tag name and the tag mark
         tagDict[translate_branch_name(record.data)] = mark
@@ -622,17 +637,17 @@ def process_database_record(record):
     elif record.action == Actions.BRANCH_BASELINE:
         # the idea hers is to simply 'reset' to create our new branch, the name of which is contained in the 'data' field
 
-        print("reset refs/heads/%s" % translate_branch_name(record.data))
+        binprint("reset refs/heads/%s" % translate_branch_name(record.data))
 
         parentBranch = translate_branch_name(record.branch)
         if is_snapshot_branch(parentBranch, os.path.split(record.path)[0]):
             # Git won't let us refer to the tag directly (maybe this will be fixed in a future version).
             # for now, we have to refer to the associated tag mark instead.
             # (if this is fixed in the future, we can get rid of tagDict altogether)
-            print("from :%d" % tagDict[parentBranch])
+            binprint("from :%d" % tagDict[parentBranch])
         else:
             # baseline branch
-            print("from refs/heads/%s" % parentBranch)
+            binprint("from refs/heads/%s" % parentBranch)
 
     elif record.action == Actions.FILE_MODIFY or record.action == Actions.FILE_DELETE or record.action == Actions.FILE_RENAME:
         # this is the usual case
@@ -641,33 +656,33 @@ def process_database_record(record):
             blobMark = print_blob_for_file(record.branch, record.path, record.version)
 
         mark = mark + 1
-        print("commit refs/heads/%s" % translate_branch_name(record.branch))
-        print("mark :%d" % mark)
-        print("author %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
-        print("committer %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
+        binprint("commit refs/heads/%s" % translate_branch_name(record.branch))
+        binprint("mark :%d" % mark)
+        binprint("author %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
+        binprint("committer %s <%s> %s %s" % (record.author, record.author, record.timestamp, timezone))
         if record.comment:
-            print("data %d" % len(record.comment))
-            print(record.comment)
+            binprint("data %d" % len(record.comment))
+            binprint(record.comment)
         else:
-            print("data 0")
+            binprint("data 0")
 
         if record.action == Actions.FILE_MODIFY:
             if record.origPath:
                 # looks like there was a previous rename.  use the original name.
-                print("M 100644 :%d %s" % (blobMark, record.origPath))
+                binprint("M 100644 :%d %s" % (blobMark, record.origPath))
             else:
                 # no previous rename.  good to use the current name.
-                print("M 100644 :%d %s" % (blobMark, record.path))
+                binprint("M 100644 :%d %s" % (blobMark, record.path))
         elif record.action == Actions.FILE_DELETE:
-            print("D %s" % record.path)
+            binprint("D %s" % record.path)
         elif record.action == Actions.FILE_RENAME:
             # NOTE we're not using record.path here, as there may have been multiple renames in the file's history
-            print("R %s %s" % (record.origPath, record.data))
+            binprint("R %s %s" % (record.origPath, record.data))
         else:
             # this is a branch operation
             if record.data:
                 # record the other ancestor
-                print("merge refs/heads/%s" % translate_branch_name(record.data))
+                binprint("merge refs/heads/%s" % translate_branch_name(record.data))
     else:
         raise Exception("Unknown record action")
 
@@ -684,7 +699,7 @@ def get_next_database_record(database, c):
 
 
 def cmd_export(database_path):
-    sys.stdout.write("\n[+] Beginning export phase...\n")
+    # sys.stdout.write("\n[+] Beginning export phase...\n")
 
     count = 0
     database = sqlite3.connect(database_path)
@@ -698,8 +713,10 @@ def cmd_export(database_path):
         # print progress every 10 operations
         if count % 10 == 0:
             # just print the date we're currently servicing
-            print("progress", time.strftime('%Y-%m-%d', time.localtime(record[0])))
 
+            record_time = time.strftime('%Y-%m-%d', time.localtime(record[0]))
+            local_time = time.strftime('%H:%M', time.localtime())
+            print("record:{} now:{} count:{}".format(record_time, local_time, count))
     # cleanup
     try:
         shutil.rmtree(scratchDir)
@@ -767,4 +784,7 @@ def main():
 
 
 if __name__ == "__main__":
+    #print(get_lines_from_sscm_cmd('sscm history "AirScheduleTestsCalculatePricingData.xml" -b"ColletteVacations" -p"ColletteVacations/Neo 2/Collette.Air.Tests" | tail -n +5'))
+    #find_all_file_versions(r"e:\projects\collette\surround\Neo2Dev", "ColletteVacations", "ColletteVacations/Neo 2/Collette.Air.Tests/AirScheduleTestsCalculatePricingData.xml
+    find_all_file_versions(r"e:\projects\collette\surround\Neo2Dev", "ColletteVacations", "ColletteVacations/Neo 2/Collette.Air.Tests/ETicket/ETicketSeatsParserTests.cs")
     main()
